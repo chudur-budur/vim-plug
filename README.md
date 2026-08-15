@@ -274,6 +274,7 @@ vim.cmd('silent! colorscheme seoul256')
 | `dir`                   | Custom directory for the plugin                             |
 | `as`                    | Use different name for the plugin                           |
 | `do`                    | Post-update hook (string or funcref)                        |
+| `onclean`               | Pre-clean hook (string or funcref)                           |
 | `on`                    | On-demand loading: Commands or `<Plug>`-mappings            |
 | `for`                   | On-demand loading: File types                               |
 | `frozen`                | Do not remove and do not update unless explicitly specified |
@@ -362,6 +363,39 @@ with the bang-versions of the commands: `PlugInstall!` and `PlugUpdate!`.
 > let g:fzf_install = 'yes | ./install'
 > Plug 'junegunn/fzf', { 'do': g:fzf_install }
 > ```
+
+## Pre-clean hooks
+
+If a plugin needs some cleanup task to be performed before `:PlugClean` scans
+and removes plugin directories, use the `onclean` option. It follows the same
+rules as the `do` option: it can be a shell command, a Vim command prefixed
+with `:`, or a Vim function reference.
+
+```vim
+Plug 'junegunn/fzf', { 'onclean': 'rm -f ~/.fzf/tags' }
+Plug 'fatih/vim-go', { 'onclean': ':GoCleanBinaries' }
+Plug 'ycm-core/YouCompleteMe', { 'onclean': function('CleanYCM') }
+```
+
+The hook is executed inside the directory of the plugin, once per
+`:PlugClean` invocation, for every plugin that defines it and is still
+installed, regardless of whether that particular plugin ends up being
+removed. A Vim function reference is called with a dictionary argument
+containing a single `name` field with the name of the plugin.
+
+`onclean` is most useful for cleaning up after a plugin you're about to
+remove, so it's designed to still run even after you delete or comment out
+its `Plug` line: whenever `plug#end()` runs, shell-command and `:`-command
+hooks (not funcrefs, which can't be persisted) are mirrored to a small state
+file (`.onclean_state`) next to `plug.vim` in your `autoload` directory.
+`:PlugClean` consults that file for directories that are no longer declared,
+so the hook still fires right before such a directory is deleted. The entry
+is removed once the directory is gone. Because of this, a funcref `onclean`
+only runs while its `Plug` line is still present.
+
+`:PlugClean` asks `Run onclean hook for <name>: <command>? (y/N)` before
+running each `onclean` hook; answer `y` to run it, anything else to skip
+it. Use `:PlugClean!` to run every hook without being asked.
 
 ### `PlugInstall!` and `PlugUpdate!`
 

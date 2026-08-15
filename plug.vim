@@ -404,6 +404,7 @@ function! plug#end()
   else
     call s:reload_plugins()
   endif
+  call s:onclean_state_sync()
 endfunction
 
 function! s:loaded_names()
@@ -737,11 +738,13 @@ function! s:parse_options(arg)
         throw printf(opt_errfmt, opt, 'string or list')
       endif
     endfor
-    if has_key(a:arg, 'do')
-      \ && type(a:arg.do) != s:TYPE.funcref
-      \ && (type(a:arg.do) != s:TYPE.string || empty(a:arg.do))
-        throw printf(opt_errfmt, 'do', 'string or funcref')
-    endif
+    for opt in ['do', 'onclean']
+      if has_key(a:arg, opt)
+      \ && type(a:arg[opt]) != s:TYPE.funcref
+      \ && (type(a:arg[opt]) != s:TYPE.string || empty(a:arg[opt]))
+        throw printf(opt_errfmt, opt, 'string or funcref')
+      endif
+    endfor
     call extend(opts, a:arg)
     if has_key(opts, 'dir')
       let opts.dir = s:dirpath(s:plug_expand(opts.dir))
@@ -2477,7 +2480,133 @@ function! s:rm_rf(dir)
   endif
 endfunction
 
+" Onclean hooks must survive the removal of their `Plug` line (that's the
+" main point of the option: cleaning up after a plugin that is going away),
+" so string-type hooks (shell command or ':Cmd') are mirrored to a small
+" state file in g:plug_home, keyed by plugin directory, independent of
+" g:plugs. Funcref hooks cannot be serialized and therefore only run while
+" the `Plug` line declaring them is still present.
+function! s:onclean_state_file()
+  return fnamemodify(s:me, ':h') . '/.onclean_state'
+endfunction
+
+function! s:onclean_state_load()
+  let file = s:onclean_state_file()
+  if !filereadable(file)
+    return {}
+  endif
+  let lines = readfile(file)
+  let state = {}
+  let i = 0
+  while i + 1 < len(lines)
+    let state[lines[i]] = lines[i + 1]
+    let i += 2
+  endwhile
+  return state
+endfunction
+
+function! s:onclean_state_save(state)
+  let lines = []
+  for [dir, cmd] in items(a:state)
+    call extend(lines, [dir, cmd])
+  endfor
+  try
+    call writefile(lines, s:onclean_state_file())
+  catch
+  endtry
+endfunction
+
+" Called from plug#end() so the state file always reflects the hooks
+" currently declared in the vimrc, while keeping entries for plugins that
+" were since undeclared but whose directory hasn't been cleaned yet.
+function! s:onclean_state_sync()
+  let state = s:onclean_state_load()
+  call filter(state, 'isdirectory(v:key)')
+  for spec in values(g:plugs)
+    if has_key(spec, 'onclean') && type(spec.onclean) == s:TYPE.string
+      let state[spec.dir] = spec.onclean
+    endif
+  endfor
+  call s:onclean_state_save(state)
+endfunction
+
+" Called from s:delete() once a directory has actually been removed.
+function! s:onclean_state_forget(dir)
+  let state = s:onclean_state_load()
+  if has_key(state, a:dir)
+    call remove(state, a:dir)
+    call s:onclean_state_save(state)
+  endif
+endfunction
+
+function! s:run_onclean(name, spec)
+  let error = ''
+  let type = type(a:spec.onclean)
+  if type == s:TYPE.string
+    if a:spec.onclean[0] == ':'
+      if has_key(g:plugs, a:name) && !get(s:loaded, a:name, 0)
+        let s:loaded[a:name] = 1
+        call s:reorg_rtp()
+      endif
+      call s:load_plugin(a:spec)
+      try
+        execute a:spec.onclean[1:]
+      catch
+        let error = v:exception
+      endtry
+    else
+      let error = s:bang(a:spec.onclean)
+    endif
+  elseif type == s:TYPE.funcref
+    try
+      call s:load_plugin(a:spec)
+      call a:spec.onclean({ 'name': a:name })
+    catch
+      let error = v:exception
+    endtry
+  else
+    let error = 'Invalid hook type'
+  endif
+  return error
+endfunction
+
+function! s:onclean_hooks(force)
+  let todo = []
+  let seen = {}
+  for [name, spec] in items(g:plugs)
+    if has_key(spec, 'onclean') && isdirectory(get(spec, 'dir', ''))
+      call add(todo, [name, spec])
+      let seen[spec.dir] = 1
+    endif
+  endfor
+  for [dir, cmd] in items(s:onclean_state_load())
+    if !has_key(seen, dir) && isdirectory(dir)
+      call add(todo, [fnamemodify(s:trim(dir), ':t'), { 'dir': dir, 'onclean': cmd }])
+    endif
+  endfor
+
+  if empty(todo)
+    return
+  endif
+
+  echom 'Running onclean hooks'
+  let cwd = getcwd()
+  for [name, spec] in todo
+    " Confirm before running any onclean hook, unless forced (:PlugClean!).
+    if !a:force && !s:ask_no_interrupt(printf('Run onclean hook for %s: `%s`?', name, spec.onclean))
+      echom printf('- onclean hook for %s ... Skipped', name)
+      continue
+    endif
+    execute 'cd' s:esc(spec.dir)
+    let error = s:run_onclean(name, spec)
+    execute 'cd' s:esc(cwd)
+    echom empty(error) ? printf('- onclean hook for %s ... OK', name)
+                      \ : printf('- onclean hook for %s ... Error: %s', name, error)
+  endfor
+endfunction
+
 function! s:clean(force)
+  call s:onclean_hooks(a:force)
   call s:prepare()
   call append(0, 'Searching for invalid plugins in '.g:plug_home)
   call append(1, '')
@@ -2568,6 +2697,7 @@ function! s:delete(range, force)
         setlocal modifiable
         if empty(err)
           call setline(l1, '~'.line[1:])
+          call s:onclean_state_forget(line[2:])
           let s:clean_count += 1
         else
           delete _
